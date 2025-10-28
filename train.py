@@ -257,56 +257,41 @@ class Flickr8kTrainer:
     - Automatic checkpoint saving
     """
     
-    def __init__(
-        self,
-        model: nn.Module,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        config: Dict,
-        device: str = 'cuda',
-        local_rank: int = 0
-    ):
+    def __init__(self, model: nn.Module, train_loader: DataLoader, val_loader: DataLoader,
+                 config: Dict, device: str = 'cuda', local_rank: int = 0):
         self.config = config
         self.device = device
         self.local_rank = local_rank
         self.is_main = (local_rank == 0)
         
-        # Model setup
-        self.model = model.to(device)
-        
-        # Wrap với DDP nếu dùng multi-GPU
-        if torch.cuda.device_count() > 1 and dist.is_initialized():
-            self.model = DDP(self.model, device_ids=[local_rank])
-            if self.is_main:
-                print(f"🔧 [Rank {local_rank}] Initialized DDP")
+        # ✅ THÊM COMMENT VÀ ĐẶT CÁC BIẾN NÀY LÊN TRƯỚC
+        # Training hyperparameters - phải đặt trước optimizer và scheduler
+        self.grad_accum_steps = config.get('grad_accum_steps', 4)
+        self.grad_clip = config.get('grad_clip', 1.0)
+        self.label_smoothing = config.get('label_smoothing', 0.1)
+        self.use_amp = config.get('use_amp', True)
         
         # Data loaders
         self.train_loader = train_loader
         self.val_loader = val_loader
         
-        # Optimizer: AdamW với decoupled weight decay
-        self.optimizer = self._create_optimizer()
+        # Model setup
+        self.model = model.to(device)
+        if torch.cuda.device_count() > 1 and dist.is_initialized():
+            self.model = DDP(self.model, device_ids=[local_rank])
         
-        # Scheduler: OneCycleLR
+        # ✅ BÂY GIỜ MỚI TẠO OPTIMIZER VÀ SCHEDULER (sau khi grad_accum_steps đã tồn tại)
+        # Optimizer and scheduler
+        self.optimizer = self._create_optimizer()
         self.scheduler = self._create_scheduler()
         
         # Mixed precision
-        self.use_amp = config.get('use_amp', True)
         self.scaler = GradScaler() if self.use_amp else None
         
         # Training state
         self.global_step = 0
         self.epoch = 0
         self.best_val_loss = float('inf')
-        
-        # Gradient accumulation
-        self.grad_accum_steps = config.get('grad_accum_steps', 4)
-        
-        # Gradient clipping
-        self.grad_clip = config.get('grad_clip', 1.0)
-        
-        # Label smoothing
-        self.label_smoothing = config.get('label_smoothing', 0.1)
         
         # Checkpoint directory
         self.checkpoint_dir = Path(config.get('checkpoint_dir', './checkpoints'))
@@ -797,4 +782,5 @@ if __name__ == '__main__':
     np.random.seed(42)
     
     # Run training
+
     main()
