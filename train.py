@@ -6,6 +6,7 @@ FIXES:
 - Thêm validation để detect token issues
 - Sửa tokenization logic
 - Thêm error handling cho data loading
+- ✅ CHỈ LƯU BEST VÀ LAST CHECKPOINT
 
 Usage:
     Single GPU: CUDA_LAUNCH_BLOCKING=1 python train.py
@@ -69,9 +70,6 @@ class Flickr8kProcessor:
         df['caption'] = df['caption'].str.lower()
         df['caption'] = df['caption'].str.replace('[^a-z0-9\\s]', '', regex=True)
         df['caption'] = df['caption'].str.strip()
-        
-        # ✅ FIX: Thêm special tokens - KHÔNG thêm ở đây, sẽ thêm khi tokenize
-        # df['caption'] = '<start> ' + df['caption'] + ' <end>'
         
         print(f"✓ Loaded {len(df)} captions từ {df['image'].nunique()} ảnh")
         return df
@@ -321,7 +319,9 @@ class Flickr8kTrainer:
     """
     Trainer được tối ưu cho Kaggle với 2x T4 GPU (16GB mỗi GPU)
     
-    ✅ FIXED: Thêm validation và error handling
+    ✅ FIXED: 
+    - Thêm validation và error handling
+    - CHỈ LƯU BEST VÀ LAST CHECKPOINT
     """
     
     def __init__(self, model: nn.Module, train_loader: DataLoader, val_loader: DataLoader,
@@ -526,8 +526,14 @@ class Flickr8kTrainer:
         avg_loss = total_loss / max(total_tokens, 1)
         return avg_loss
     
-    def save_checkpoint(self, is_best: bool = False):
-        """Save checkpoint"""
+    def save_checkpoint(self, is_best: bool = False, is_last: bool = False):
+        """
+        ✅ FIXED: Chỉ lưu best và last checkpoint
+        
+        Args:
+            is_best: True nếu đây là checkpoint tốt nhất
+            is_last: True nếu đây là checkpoint cuối cùng
+        """
         if not self.is_main:
             return
         
@@ -547,16 +553,17 @@ class Flickr8kTrainer:
             'config': self.config
         }
         
-        # Save regular checkpoint
-        ckpt_path = self.checkpoint_dir / f'checkpoint_epoch_{self.epoch}.pt'
-        torch.save(checkpoint, ckpt_path)
-        print(f"💾 Saved checkpoint: {ckpt_path}")
-        
-        # Save best model
+        # ✅ Save best model
         if is_best:
             best_path = self.checkpoint_dir / 'best_model.pt'
             torch.save(checkpoint, best_path)
-            print(f"🏆 Saved best model: {best_path}")
+            print(f"🏆 Saved best model (val_loss={self.best_val_loss:.4f}): {best_path}")
+        
+        # ✅ Save last checkpoint (overwrite mỗi epoch)
+        if is_last:
+            last_path = self.checkpoint_dir / 'last_checkpoint.pt'
+            torch.save(checkpoint, last_path)
+            print(f"💾 Saved last checkpoint (epoch {self.epoch}): {last_path}")
     
     def train(self, num_epochs: int):
         """Full training loop"""
@@ -575,6 +582,7 @@ class Flickr8kTrainer:
             print(f"🔧 Gradient accumulation steps: {self.grad_accum_steps}")
             gpu_count = torch.cuda.device_count() if dist.is_initialized() else 1
             print(f"🔧 Effective batch size: {self.config['batch_size'] * self.grad_accum_steps * gpu_count}")
+            print(f"💾 Checkpoint strategy: Lưu BEST và LAST checkpoint")
             print("="*70 + "\n")
         
         for epoch in range(num_epochs):
@@ -600,21 +608,22 @@ class Flickr8kTrainer:
                 print(f"   Time: {train_time:.1f}s")
                 print(f"{'='*70}\n")
             
-            # Save checkpoint
+            # ✅ FIXED: Chỉ lưu best và last
             is_best = val_loss < self.best_val_loss
             if is_best:
                 self.best_val_loss = val_loss
+                self.save_checkpoint(is_best=True, is_last=False)
             
-            self.save_checkpoint(is_best=is_best)
-            
-            # Save every N epochs
-            if (epoch + 1) % self.config.get('save_every', 5) == 0:
-                self.save_checkpoint()
+            # Luôn lưu last checkpoint
+            self.save_checkpoint(is_best=False, is_last=True)
         
         if self.is_main:
             print("\n" + "="*70)
             print("✅ HOÀN THÀNH TRAINING")
             print(f"🏆 Best validation loss: {self.best_val_loss:.4f}")
+            print(f"💾 Checkpoints saved:")
+            print(f"   - best_model.pt (val_loss={self.best_val_loss:.4f})")
+            print(f"   - last_checkpoint.pt (epoch {self.epoch})")
             print("="*70)
 
 
@@ -686,9 +695,6 @@ def main():
         'pin_memory': True,
         'prefetch_factor': 2,
         'min_word_freq': 2,
-        
-        # Logging
-        'save_every': 5,
     }
     
     # Setup distributed
@@ -872,8 +878,3 @@ if __name__ == '__main__':
     
     # Run training
     main()
-
-
-
-
-
