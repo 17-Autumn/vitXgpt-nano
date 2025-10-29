@@ -165,7 +165,7 @@ class Flickr8kDataset(Dataset):
         df: pd.DataFrame,
         images_dir: str,
         word2idx: Dict,
-        max_length: int = 50,
+        max_length: int = 128,
         img_size: int = 224,
         is_train: bool = True
     ):
@@ -670,7 +670,7 @@ def main():
         'num_registers': 4,
         
         # Training hyperparameters (tối ưu cho T4)
-        'batch_size': 8,
+        'batch_size': 12,
         'epochs': 12,
         'lr': 3e-4,
         'weight_decay': 0.01,
@@ -685,7 +685,7 @@ def main():
         'num_workers': 4,
         'pin_memory': True,
         'prefetch_factor': 2,
-        'min_word_freq': 5,
+        'min_word_freq': 2,
         
         # Logging
         'save_every': 5,
@@ -872,3 +872,4 @@ if __name__ == '__main__':
     
     # Run training
     main()
+
