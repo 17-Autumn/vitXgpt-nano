@@ -1,9 +1,9 @@
 """
-Resume Training với Heavy Data Augmentation - Multi-GPU Version
+Resume Training với Heavy Data Augmentation - Multi-GPU Version (FIXED)
 Hỗ trợ training trên 2 GPU T4 trên Kaggle
 
 Usage:
-    python train_with_augmentation_multi_gpu.py
+    python train_with_augmentation_multi_gpu_fixed.py
 """
 
 import torch
@@ -32,7 +32,13 @@ import time
 import warnings
 warnings.filterwarnings('ignore')
 
-from model import ModernImageCaptioningModel
+# Import model - MAKE SURE model.py is available
+try:
+    from model import ModernImageCaptioningModel
+except ImportError:
+    print("⚠️ Cannot import ModernImageCaptioningModel from model.py")
+    print("   Please make sure model.py is in the same directory!")
+    raise
 
 
 # =====================================================================
@@ -45,16 +51,16 @@ def setup_distributed(rank, world_size):
     
     # Khởi tạo process group
     dist.init_process_group(
-        backend='nccl',  # GPU backend
+        backend='nccl',
         init_method='env://',
         world_size=world_size,
         rank=rank
     )
     
-    # Set device
     torch.cuda.set_device(rank)
     
-    print(f"🚀 Process {rank}/{world_size} initialized on GPU {rank}")
+    if rank == 0:
+        print(f"🚀 Process {rank}/{world_size} initialized on GPU {rank}")
 
 
 def cleanup_distributed():
@@ -64,7 +70,124 @@ def cleanup_distributed():
 
 
 # =====================================================================
-# HEAVY DATA AUGMENTATION DATASET
+# DATA PROCESSING (Simplified Flickr8k Processor)
+# =====================================================================
+class SimpleFlickr8kProcessor:
+    """Simplified data processor for Flickr8k"""
+    
+    def __init__(self, data_dir: str):
+        self.data_dir = Path(data_dir)
+        self.images_dir = self.data_dir / 'Images'
+        self.captions_file = self.data_dir / 'captions.txt'
+        
+    def load_and_clean_captions(self):
+        """Load captions from CSV"""
+        df = pd.read_csv(self.captions_file)
+        
+        # Clean captions
+        df['caption'] = df['caption'].str.lower()
+        df['caption'] = df['caption'].str.replace(r'[^a-z\s]', '', regex=True)
+        df['caption'] = df['caption'].str.strip()
+        
+        return df
+    
+    def split_dataset(self, df, train_ratio=0.8, val_ratio=0.1):
+        """Split dataset"""
+        unique_images = df['image'].unique()
+        np.random.seed(42)
+        np.random.shuffle(unique_images)
+        
+        n_train = int(len(unique_images) * train_ratio)
+        n_val = int(len(unique_images) * val_ratio)
+        
+        train_images = unique_images[:n_train]
+        val_images = unique_images[n_train:n_train + n_val]
+        test_images = unique_images[n_train + n_val:]
+        
+        train_df = df[df['image'].isin(train_images)].reset_index(drop=True)
+        val_df = df[df['image'].isin(val_images)].reset_index(drop=True)
+        test_df = df[df['image'].isin(test_images)].reset_index(drop=True)
+        
+        return train_df, val_df, test_df
+
+
+# =====================================================================
+# SIMPLE DATASET (for validation)
+# =====================================================================
+class SimpleFlickr8kDataset(Dataset):
+    """Simple dataset without heavy augmentation (for validation)"""
+    
+    def __init__(
+        self, 
+        df: pd.DataFrame,
+        images_dir: str,
+        word2idx: Dict,
+        max_length: int = 128,
+        img_size: int = 224
+    ):
+        self.df = df.reset_index(drop=True)
+        self.images_dir = Path(images_dir)
+        self.word2idx = word2idx
+        self.max_length = max_length
+        
+        self.pad_idx = word2idx['<pad>']
+        self.start_idx = word2idx['<start>']
+        self.end_idx = word2idx['<end>']
+        self.unk_idx = word2idx['<unk>']
+        
+        self.transform = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+    
+    def tokenize(self, caption: str) -> List[int]:
+        words = caption.split()
+        tokens = [self.word2idx.get(word, self.unk_idx) for word in words]
+        tokens = [self.start_idx] + tokens + [self.end_idx]
+        
+        if len(tokens) > self.max_length:
+            tokens = [self.start_idx] + tokens[1:self.max_length-1] + [self.end_idx]
+        
+        if len(tokens) < self.max_length:
+            tokens = tokens + [self.pad_idx] * (self.max_length - len(tokens))
+        
+        return tokens
+    
+    def __len__(self):
+        return len(self.df)
+    
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        
+        img_path = self.images_dir / row['image']
+        try:
+            image = Image.open(img_path).convert('RGB')
+            image = self.transform(image)
+        except Exception as e:
+            image = torch.zeros(3, 224, 224)
+        
+        tokens = self.tokenize(row['caption'])
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        
+        input_ids = tokens[:-1]
+        target_ids = tokens[1:]
+        attention_mask = (target_ids != self.pad_idx).long()
+        
+        return {
+            'image': image,
+            'input_ids': input_ids,
+            'target_ids': target_ids,
+            'attention_mask': attention_mask,
+            'caption': row['caption']
+        }
+
+
+# =====================================================================
+# HEAVY AUGMENTATION DATASET
 # =====================================================================
 class HeavyAugmentedFlickr8kDataset(Dataset):
     """Dataset với augmentation CỰC MẠNH"""
@@ -78,19 +201,17 @@ class HeavyAugmentedFlickr8kDataset(Dataset):
         img_size: int = 224,
         augmentation_level: str = 'heavy'
     ):
-        self.df = df.reset_index(drop=True)  # Reset index để đảm bảo continuous
+        self.df = df.reset_index(drop=True)
         self.images_dir = Path(images_dir)
         self.word2idx = word2idx
         self.max_length = max_length
         self.augmentation_level = augmentation_level
         
-        # Special tokens
         self.pad_idx = word2idx['<pad>']
         self.start_idx = word2idx['<start>']
         self.end_idx = word2idx['<end>']
         self.unk_idx = word2idx['<unk>']
         
-        # Transforms
         if augmentation_level == 'heavy':
             self.transform = self._get_heavy_augmentation(img_size)
         else:
@@ -157,7 +278,6 @@ class HeavyAugmentedFlickr8kDataset(Dataset):
         ])
     
     def tokenize(self, caption: str) -> List[int]:
-        """Tokenize caption"""
         words = caption.split()
         tokens = [self.word2idx.get(word, self.unk_idx) for word in words]
         tokens = [self.start_idx] + tokens + [self.end_idx]
@@ -176,16 +296,13 @@ class HeavyAugmentedFlickr8kDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         
-        # Load image
         img_path = self.images_dir / row['image']
         try:
             image = Image.open(img_path).convert('RGB')
             image = self.transform(image)
         except Exception as e:
-            # Fallback: black image
             image = torch.zeros(3, 224, 224)
         
-        # Tokenize
         tokens = self.tokenize(row['caption'])
         tokens = torch.tensor(tokens, dtype=torch.long)
         
@@ -222,53 +339,42 @@ class MultiGPUTrainer:
         self.world_size = world_size
         self.is_main = (rank == 0)
         
-        # Device
         self.device = f'cuda:{rank}'
         torch.cuda.set_device(rank)
         
-        # Training params
         self.grad_accum_steps = config.get('grad_accum_steps', 4)
         self.grad_clip = config.get('grad_clip', 1.0)
         self.label_smoothing = config.get('label_smoothing', 0.1)
         self.use_amp = config.get('use_amp', True)
         
-        # Early stopping
         self.patience = config.get('patience', 5)
         self.patience_counter = 0
         self.min_delta = config.get('min_delta', 0.001)
         
-        # Data loaders
         self.train_loader = train_loader
         self.val_loader = val_loader
         
-        # Model setup
         self.model = model.to(self.device)
         self.model = DDP(
             self.model, 
             device_ids=[rank],
             output_device=rank,
-            find_unused_parameters=False  # Tối ưu performance
+            find_unused_parameters=False
         )
         
-        # Optimizer and scheduler
         self.optimizer = self._create_optimizer()
         self.scheduler = self._create_scheduler()
-        
-        # Mixed precision
         self.scaler = GradScaler() if self.use_amp else None
         
-        # Training state
         self.global_step = 0
         self.epoch = 0
         self.best_val_loss = float('inf')
         
-        # Checkpoint directory
         self.checkpoint_dir = Path(config.get('checkpoint_dir', '/kaggle/working/checkpoints'))
         if self.is_main:
             self.checkpoint_dir.mkdir(exist_ok=True, parents=True)
     
     def _create_optimizer(self):
-        """Create optimizer"""
         decay = []
         no_decay = []
         
@@ -288,7 +394,6 @@ class MultiGPUTrainer:
         return optimizer
     
     def _create_scheduler(self):
-        """Create scheduler"""
         total_steps = len(self.train_loader) * self.config.get('epochs', 20) // self.grad_accum_steps
         
         scheduler = OneCycleLR(
@@ -304,12 +409,10 @@ class MultiGPUTrainer:
         return scheduler
     
     def train_epoch(self):
-        """Train one epoch"""
         self.model.train()
         total_loss = 0
         total_tokens = 0
         
-        # Set epoch for sampler
         if hasattr(self.train_loader.sampler, 'set_epoch'):
             self.train_loader.sampler.set_epoch(self.epoch)
         
@@ -365,7 +468,6 @@ class MultiGPUTrainer:
                     'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
                 })
         
-        # Sync metrics across GPUs
         metrics = torch.tensor([total_loss, total_tokens], device=self.device)
         dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
         total_loss, total_tokens = metrics.cpu().numpy()
@@ -375,7 +477,6 @@ class MultiGPUTrainer:
     
     @torch.no_grad()
     def validate(self):
-        """Validate model"""
         self.model.eval()
         total_loss = 0
         total_tokens = 0
@@ -404,7 +505,6 @@ class MultiGPUTrainer:
             if self.is_main:
                 pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
         
-        # Sync metrics
         metrics = torch.tensor([total_loss, total_tokens], device=self.device)
         dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
         total_loss, total_tokens = metrics.cpu().numpy()
@@ -413,7 +513,6 @@ class MultiGPUTrainer:
         return avg_loss
     
     def check_early_stopping(self, val_loss):
-        """Check early stopping"""
         if val_loss < self.best_val_loss - self.min_delta:
             self.best_val_loss = val_loss
             self.patience_counter = 0
@@ -425,11 +524,9 @@ class MultiGPUTrainer:
             return False, False
     
     def save_checkpoint(self, is_best: bool = False, is_last: bool = False):
-        """Save checkpoint (only main process)"""
         if not self.is_main:
             return
         
-        # Get model state (unwrap DDP)
         model_state = self.model.module.state_dict()
         
         checkpoint = {
@@ -454,7 +551,6 @@ class MultiGPUTrainer:
             print(f"💾 Saved last checkpoint: {last_path}")
     
     def load_checkpoint(self, checkpoint_path: str):
-        """Load checkpoint"""
         if not os.path.exists(checkpoint_path):
             if self.is_main:
                 print(f"⚠️ Checkpoint not found: {checkpoint_path}")
@@ -463,17 +559,12 @@ class MultiGPUTrainer:
         if self.is_main:
             print(f"📥 Loading checkpoint: {checkpoint_path}")
         
-        # Load to correct device
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
-        # Load model (unwrap DDP)
         self.model.module.load_state_dict(checkpoint['model_state_dict'])
-        
-        # Load optimizer and scheduler
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
-        # Load training state
         self.epoch = checkpoint.get('epoch', 0)
         self.global_step = checkpoint.get('global_step', 0)
         self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
@@ -485,7 +576,6 @@ class MultiGPUTrainer:
         return True
     
     def train(self, num_epochs: int):
-        """Full training loop"""
         if self.is_main:
             print("\n" + "="*70)
             print("🚀 MULTI-GPU TRAINING với HEAVY AUGMENTATION")
@@ -499,12 +589,10 @@ class MultiGPUTrainer:
         for epoch in range(start_epoch, start_epoch + num_epochs):
             self.epoch = epoch
             
-            # Train
             start_time = time.time()
             train_loss = self.train_epoch()
             train_time = time.time() - start_time
             
-            # Validate
             val_loss = self.validate()
             
             if self.is_main:
@@ -515,7 +603,6 @@ class MultiGPUTrainer:
                 print(f"   Time: {train_time:.1f}s | Patience: {self.patience_counter}/{self.patience}")
                 print(f"{'='*70}\n")
             
-            # Early stopping
             should_stop, is_best = self.check_early_stopping(val_loss)
             
             if is_best:
@@ -538,11 +625,9 @@ class MultiGPUTrainer:
 def train_worker(rank, world_size, config):
     """Worker function cho mỗi GPU"""
     
-    # Setup distributed
     setup_distributed(rank, world_size)
     
     try:
-        # Set seed
         torch.manual_seed(42 + rank)
         np.random.seed(42 + rank)
         
@@ -559,8 +644,7 @@ def train_worker(rank, world_size, config):
             print(f"✓ Loaded vocabulary: {config['vocab_size']} tokens")
         
         # Load data
-        from train import Flickr8kProcessor
-        processor = Flickr8kProcessor(config['data_dir'])
+        processor = SimpleFlickr8kProcessor(config['data_dir'])
         df = processor.load_and_clean_captions()
         train_df, val_df, _ = processor.split_dataset(df)
         
@@ -598,12 +682,10 @@ def train_worker(rank, world_size, config):
             print(f"✓ Augmented training samples: {len(combined_train_dataset)} (3x)")
         
         # Validation dataset
-        from train import Flickr8kDataset
-        val_dataset = Flickr8kDataset(
+        val_dataset = SimpleFlickr8kDataset(
             val_df, images_dir, word2idx,
             max_length=config['max_seq_len'],
-            img_size=config['img_size'],
-            is_train=False
+            img_size=config['img_size']
         )
         
         # Create samplers
@@ -630,7 +712,7 @@ def train_worker(rank, world_size, config):
             num_workers=config['num_workers'],
             pin_memory=True,
             prefetch_factor=2,
-            persistent_workers=True
+            persistent_workers=True if config['num_workers'] > 0 else False
         )
         
         val_loader = DataLoader(
@@ -640,7 +722,7 @@ def train_worker(rank, world_size, config):
             num_workers=config['num_workers'],
             pin_memory=True,
             prefetch_factor=2,
-            persistent_workers=True
+            persistent_workers=True if config['num_workers'] > 0 else False
         )
         
         # Create model
@@ -677,8 +759,12 @@ def train_worker(rank, world_size, config):
         # Train
         trainer.train(num_epochs=config['epochs'])
         
+    except Exception as e:
+        print(f"❌ Error in rank {rank}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
     finally:
-        # Cleanup
         cleanup_distributed()
 
 
@@ -693,7 +779,7 @@ def main():
         # Paths (FIXED for Kaggle)
         'data_dir': '/kaggle/input/flickr8k',
         'vocab_dir': '/kaggle/input/vit-gpt2-nano/checkpoints',
-        'checkpoint_dir': '/kaggle/working/checkpoints',  # Writable directory
+        'checkpoint_dir': '/kaggle/working/checkpoints',
         'resume_checkpoint': '/kaggle/input/vit-gpt2-nano/checkpoints/last_checkpoint.pt',
         
         # Model
@@ -712,7 +798,7 @@ def main():
         'num_registers': 4,
         
         # Training (adjusted for 2 GPUs)
-        'batch_size': 32,  # Per GPU: 18 x 2 = 36 total
+        'batch_size': 32,  # Per GPU: 32 x 2 = 64 total
         'epochs': 2,
         'lr': 1e-4,
         'weight_decay': 0.02,
