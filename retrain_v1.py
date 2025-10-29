@@ -713,7 +713,7 @@ def main():
         
         # Training (adjusted for 2 GPUs)
         'batch_size': 32,  # Per GPU: 18 x 2 = 36 total
-        'epochs': 3,
+        'epochs': 2,
         'lr': 1e-4,
         'weight_decay': 0.02,
         'grad_clip': 1.0,
