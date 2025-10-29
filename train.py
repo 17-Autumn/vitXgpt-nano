@@ -1,9 +1,14 @@
 """
-Training Script cho vitXgpt-nano trên Flickr8k Dataset
+Training Script cho vitXgpt-nano trên Flickr8k Dataset - FIXED VERSION
 Tối ưu cho Kaggle với 2x GPU T4 (16GB VRAM mỗi GPU)
 
+FIXES:
+- Thêm validation để detect token issues
+- Sửa tokenization logic
+- Thêm error handling cho data loading
+
 Usage:
-    Single GPU: python train.py
+    Single GPU: CUDA_LAUNCH_BLOCKING=1 python train.py
     Multi GPU:  torchrun --nproc_per_node=2 train.py
 """
 
@@ -65,8 +70,8 @@ class Flickr8kProcessor:
         df['caption'] = df['caption'].str.replace('[^a-z0-9\\s]', '', regex=True)
         df['caption'] = df['caption'].str.strip()
         
-        # Thêm special tokens
-        df['caption'] = '<start> ' + df['caption'] + ' <end>'
+        # ✅ FIX: Thêm special tokens - KHÔNG thêm ở đây, sẽ thêm khi tokenize
+        # df['caption'] = '<start> ' + df['caption'] + ' <end>'
         
         print(f"✓ Loaded {len(df)} captions từ {df['image'].nunique()} ảnh")
         return df
@@ -143,7 +148,7 @@ class Flickr8kProcessor:
 
 
 # =====================================================================
-# DATASET VÀ DATALOADER TỐI ƯU
+# DATASET VÀ DATALOADER TỐI ƯU - FIXED VERSION
 # =====================================================================
 class Flickr8kDataset(Dataset):
     """
@@ -151,6 +156,8 @@ class Flickr8kDataset(Dataset):
     - Data augmentation mạnh cho ảnh
     - Efficient tokenization
     - Memory-friendly (không cache toàn bộ ảnh)
+    
+    ✅ FIXED: Proper tokenization và validation
     """
     
     def __init__(
@@ -167,6 +174,13 @@ class Flickr8kDataset(Dataset):
         self.word2idx = word2idx
         self.max_length = max_length
         self.is_train = is_train
+        
+        # ✅ Cache special token indices
+        self.pad_idx = word2idx['<pad>']
+        self.start_idx = word2idx['<start>']
+        self.end_idx = word2idx['<end>']
+        self.unk_idx = word2idx['<unk>']
+        self.vocab_size = len(word2idx)
         
         # Data augmentation cho training
         if is_train:
@@ -191,21 +205,31 @@ class Flickr8kDataset(Dataset):
                                    std=[0.229, 0.224, 0.225])
             ])
     
-    def __len__(self):
-        return len(self.df)
-    
     def tokenize(self, caption: str) -> List[int]:
-        """Tokenize caption thành list of indices"""
+        """
+        ✅ FIXED: Tokenize caption thành list of indices
+        Format: [<start>, word1, word2, ..., <end>, <pad>, ...]
+        """
         words = caption.split()
-        tokens = [self.word2idx.get(word, self.word2idx['<unk>']) for word in words]
         
-        # Padding/truncation
+        # Convert words to indices
+        tokens = [self.word2idx.get(word, self.unk_idx) for word in words]
+        
+        # Add start and end tokens
+        tokens = [self.start_idx] + tokens + [self.end_idx]
+        
+        # Truncate if too long (giữ lại start và end)
         if len(tokens) > self.max_length:
-            tokens = tokens[:self.max_length]
-        else:
-            tokens = tokens + [self.word2idx['<pad>']] * (self.max_length - len(tokens))
+            tokens = [self.start_idx] + tokens[1:self.max_length-1] + [self.end_idx]
+        
+        # Pad to max_length
+        if len(tokens) < self.max_length:
+            tokens = tokens + [self.pad_idx] * (self.max_length - len(tokens))
         
         return tokens
+    
+    def __len__(self):
+        return len(self.df)
     
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
@@ -220,16 +244,22 @@ class Flickr8kDataset(Dataset):
             # Return một ảnh trống nếu lỗi
             image = torch.zeros(3, 224, 224)
         
-        # Tokenize caption
+        # ✅ FIXED: Tokenize caption đúng cách
         tokens = self.tokenize(row['caption'])
         tokens = torch.tensor(tokens, dtype=torch.long)
         
-        # Tạo input (shifted right) và target
+        # ✅ VALIDATION: Đảm bảo tokens hợp lệ
+        assert tokens.min() >= 0, f"Negative token: {tokens.min()}"
+        assert tokens.max() < self.vocab_size, f"Token {tokens.max()} >= vocab_size {self.vocab_size}"
+        
+        # Tạo input và target cho teacher forcing
+        # Input: [<start>, word1, word2, ..., wordN]
+        # Target: [word1, word2, ..., wordN, <end>]
         input_ids = tokens[:-1]
         target_ids = tokens[1:]
         
         # Tạo attention mask (1 cho token thật, 0 cho padding)
-        attention_mask = (target_ids != self.word2idx['<pad>']).long()
+        attention_mask = (target_ids != self.pad_idx).long()
         
         return {
             'image': image,
@@ -240,21 +270,58 @@ class Flickr8kDataset(Dataset):
         }
 
 
+# ✅ THÊM HÀM VALIDATION
+def validate_dataloader(dataloader, vocab_size, num_batches=5):
+    """
+    Validate dataloader để đảm bảo không có lỗi với tokens
+    """
+    print("\n" + "="*70)
+    print("🔍 VALIDATING DATALOADER")
+    print("="*70)
+    
+    for batch_idx, batch in enumerate(dataloader):
+        if batch_idx >= num_batches:
+            break
+        
+        input_ids = batch['input_ids']
+        target_ids = batch['target_ids']
+        attention_mask = batch['attention_mask']
+        
+        print(f"\nBatch {batch_idx}:")
+        print(f"  Input shape: {input_ids.shape}")
+        print(f"  Target shape: {target_ids.shape}")
+        print(f"  Input range: [{input_ids.min()}, {input_ids.max()}]")
+        print(f"  Target range: [{target_ids.min()}, {target_ids.max()}]")
+        print(f"  Vocab size: {vocab_size}")
+        
+        # Kiểm tra có token nào vượt vocab_size không
+        if input_ids.max() >= vocab_size:
+            raise ValueError(f"⚠️ Input token {input_ids.max()} >= vocab_size {vocab_size}")
+        
+        if target_ids.max() >= vocab_size:
+            raise ValueError(f"⚠️ Target token {target_ids.max()} >= vocab_size {vocab_size}")
+        
+        if input_ids.min() < 0:
+            raise ValueError(f"⚠️ Negative input token: {input_ids.min()}")
+        
+        if target_ids.min() < 0:
+            raise ValueError(f"⚠️ Negative target token: {target_ids.min()}")
+        
+        print("  ✓ Batch valid!")
+    
+    print("\n" + "="*70)
+    print("✅ DATALOADER VALIDATION PASSED")
+    print("="*70 + "\n")
+
+
 # =====================================================================
-# TRAINER TỐI ƯU CHO 2 GPU T4
+# TRAINER TỐI ƯU CHO 2 GPU T4 - FIXED VERSION
 # =====================================================================
 class Flickr8kTrainer:
     """
     Trainer được tối ưu cho Kaggle với 2x T4 GPU (16GB mỗi GPU)
     
-    Optimizations:
-    - Mixed precision training (bfloat16)
-    - Gradient accumulation
-    - Distributed Data Parallel (DDP)
-    - OneCycleLR scheduler
-    - Label smoothing
-    - Gradient clipping
-    - Automatic checkpoint saving
+    ✅ FIXED: Thêm validation và error handling
     """
     
     def __init__(self, model: nn.Module, train_loader: DataLoader, val_loader: DataLoader,
@@ -264,8 +331,7 @@ class Flickr8kTrainer:
         self.local_rank = local_rank
         self.is_main = (local_rank == 0)
         
-        # ✅ THÊM COMMENT VÀ ĐẶT CÁC BIẾN NÀY LÊN TRƯỚC
-        # Training hyperparameters - phải đặt trước optimizer và scheduler
+        # Training hyperparameters
         self.grad_accum_steps = config.get('grad_accum_steps', 4)
         self.grad_clip = config.get('grad_clip', 1.0)
         self.label_smoothing = config.get('label_smoothing', 0.1)
@@ -280,7 +346,6 @@ class Flickr8kTrainer:
         if torch.cuda.device_count() > 1 and dist.is_initialized():
             self.model = DDP(self.model, device_ids=[local_rank])
         
-        # ✅ BÂY GIỜ MỚI TẠO OPTIMIZER VÀ SCHEDULER (sau khi grad_accum_steps đã tồn tại)
         # Optimizer and scheduler
         self.optimizer = self._create_optimizer()
         self.scheduler = self._create_scheduler()
@@ -344,65 +409,85 @@ class Flickr8kTrainer:
                    disable=not self.is_main)
         
         for step, batch in enumerate(pbar):
-            # Move to device
-            images = batch['image'].to(self.device, non_blocking=True)
-            input_ids = batch['input_ids'].to(self.device, non_blocking=True)
-            target_ids = batch['target_ids'].to(self.device, non_blocking=True)
-            attention_mask = batch['attention_mask'].to(self.device, non_blocking=True)
-            
-            # Mixed precision forward
-            with autocast(enabled=self.use_amp):
-                logits = self.model(images, input_ids)
+            try:
+                # Move to device
+                images = batch['image'].to(self.device, non_blocking=True)
+                input_ids = batch['input_ids'].to(self.device, non_blocking=True)
+                target_ids = batch['target_ids'].to(self.device, non_blocking=True)
+                attention_mask = batch['attention_mask'].to(self.device, non_blocking=True)
                 
-                # Compute loss với label smoothing
-                loss = F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)),
-                    target_ids.reshape(-1),
-                    ignore_index=self.config.get('pad_idx', 0),
-                    label_smoothing=self.label_smoothing
-                )
+                # ✅ VALIDATION: Kiểm tra input trước khi forward
+                if step == 0 and self.epoch == 0:
+                    print(f"\n🔍 First batch validation:")
+                    print(f"  Input range: [{input_ids.min()}, {input_ids.max()}]")
+                    print(f"  Target range: [{target_ids.min()}, {target_ids.max()}]")
+                    print(f"  Vocab size: {self.config['vocab_size']}")
                 
-                # Scale loss cho gradient accumulation
-                loss = loss / self.grad_accum_steps
-            
-            # Backward
-            if self.scaler is not None:
-                self.scaler.scale(loss).backward()
-            else:
-                loss.backward()
-            
-            # Update weights sau gradient accumulation
-            if (step + 1) % self.grad_accum_steps == 0:
-                # Gradient clipping
+                # Mixed precision forward
+                with autocast(enabled=self.use_amp):
+                    logits = self.model(images, input_ids)
+                    
+                    # ✅ VALIDATION: Kiểm tra output shape
+                    if step == 0 and self.epoch == 0:
+                        print(f"  Logits shape: {logits.shape}")
+                        print(f"  Expected vocab dim: {self.config['vocab_size']}")
+                    
+                    # Compute loss với label smoothing
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)),
+                        target_ids.reshape(-1),
+                        ignore_index=self.config.get('pad_idx', 0),
+                        label_smoothing=self.label_smoothing
+                    )
+                    
+                    # Scale loss cho gradient accumulation
+                    loss = loss / self.grad_accum_steps
+                
+                # Backward
                 if self.scaler is not None:
-                    self.scaler.unscale_(self.optimizer)
-                
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                
-                # Optimizer step
-                if self.scaler is not None:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                    self.scaler.scale(loss).backward()
                 else:
-                    self.optimizer.step()
+                    loss.backward()
                 
-                self.optimizer.zero_grad(set_to_none=True)
-                self.scheduler.step()
-                self.global_step += 1
+                # Update weights sau gradient accumulation
+                if (step + 1) % self.grad_accum_steps == 0:
+                    # Gradient clipping
+                    if self.scaler is not None:
+                        self.scaler.unscale_(self.optimizer)
+                    
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    
+                    # Optimizer step
+                    if self.scaler is not None:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        self.optimizer.step()
+                    
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.scheduler.step()
+                    self.global_step += 1
+                
+                # Metrics
+                batch_loss = loss.item() * self.grad_accum_steps
+                batch_tokens = attention_mask.sum().item()
+                total_loss += batch_loss * batch_tokens
+                total_tokens += batch_tokens
+                
+                # Update progress bar
+                if self.is_main:
+                    pbar.set_postfix({
+                        'loss': f'{batch_loss:.4f}',
+                        'ppl': f'{np.exp(batch_loss):.2f}',
+                        'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
+                    })
             
-            # Metrics
-            batch_loss = loss.item() * self.grad_accum_steps
-            batch_tokens = attention_mask.sum().item()
-            total_loss += batch_loss * batch_tokens
-            total_tokens += batch_tokens
-            
-            # Update progress bar
-            if self.is_main:
-                pbar.set_postfix({
-                    'loss': f'{batch_loss:.4f}',
-                    'ppl': f'{np.exp(batch_loss):.2f}',
-                    'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
-                })
+            except Exception as e:
+                print(f"\n❌ Error at step {step}:")
+                print(f"  Error: {e}")
+                print(f"  Input shape: {input_ids.shape if 'input_ids' in locals() else 'N/A'}")
+                print(f"  Target shape: {target_ids.shape if 'target_ids' in locals() else 'N/A'}")
+                raise
         
         avg_loss = total_loss / max(total_tokens, 1)
         return avg_loss
@@ -715,6 +800,10 @@ def main():
         print(f"✓ Val batches: {len(val_loader)}")
         print(f"✓ Effective batch size: {config['batch_size'] * world_size * config['grad_accum_steps']}")
     
+    # ✅ VALIDATE DATALOADER TRƯỚC KHI TRAINING
+    if is_main:
+        validate_dataloader(train_loader, config['vocab_size'], num_batches=3)
+    
     # ===== STEP 3: CREATE MODEL =====
     if is_main:
         print("\n" + "-"*70)
@@ -766,8 +855,8 @@ def main():
 
 
 if __name__ == '__main__':
-    # Set environment cho optimal performance trên T4
-    os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
+    # ✅ ENABLE CUDA_LAUNCH_BLOCKING để debug dễ hơn
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     os.environ['TORCH_CUDNN_V8_API_ENABLED'] = '1'
     
     # Enable TF32 (T4 không hỗ trợ nhưng không sao)
@@ -782,5 +871,4 @@ if __name__ == '__main__':
     np.random.seed(42)
     
     # Run training
-
     main()
