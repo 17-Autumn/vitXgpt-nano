@@ -1,11 +1,9 @@
 """
-Resume Training với Heavy Data Augmentation để giảm Overfitting
-- Load checkpoint cuối cùng
-- Tăng dữ liệu gấp 3 lần với augmentation mạnh
-- Tiếp tục training với early stopping
+Resume Training với Heavy Data Augmentation - Multi-GPU Version
+Hỗ trợ training trên 2 GPU T4 trên Kaggle
 
 Usage:
-    python train_with_augmentation.py
+    python train_with_augmentation_multi_gpu.py
 """
 
 import torch
@@ -15,6 +13,7 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import autocast, GradScaler
@@ -26,7 +25,7 @@ import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image
 from torchvision import transforms
 from typing import Optional, Dict, List, Tuple
 import time
@@ -37,18 +36,38 @@ from model import ModernImageCaptioningModel
 
 
 # =====================================================================
+# DISTRIBUTED TRAINING SETUP
+# =====================================================================
+def setup_distributed(rank, world_size):
+    """Khởi tạo distributed training"""
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    
+    # Khởi tạo process group
+    dist.init_process_group(
+        backend='nccl',  # GPU backend
+        init_method='env://',
+        world_size=world_size,
+        rank=rank
+    )
+    
+    # Set device
+    torch.cuda.set_device(rank)
+    
+    print(f"🚀 Process {rank}/{world_size} initialized on GPU {rank}")
+
+
+def cleanup_distributed():
+    """Cleanup distributed training"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+# =====================================================================
 # HEAVY DATA AUGMENTATION DATASET
 # =====================================================================
 class HeavyAugmentedFlickr8kDataset(Dataset):
-    """
-    Dataset với augmentation CỰC MẠNH để chống overfitting
-    - Blur nhiều mức độ
-    - Rotation ngẫu nhiên
-    - Flip horizontal + vertical
-    - Color jitter mạnh
-    - Random erasing
-    - Gaussian noise
-    """
+    """Dataset với augmentation CỰC MẠNH"""
     
     def __init__(
         self, 
@@ -57,121 +76,82 @@ class HeavyAugmentedFlickr8kDataset(Dataset):
         word2idx: Dict,
         max_length: int = 128,
         img_size: int = 224,
-        augmentation_level: str = 'heavy'  # 'heavy', 'extreme'
+        augmentation_level: str = 'heavy'
     ):
-        self.df = df
+        self.df = df.reset_index(drop=True)  # Reset index để đảm bảo continuous
         self.images_dir = Path(images_dir)
         self.word2idx = word2idx
         self.max_length = max_length
         self.augmentation_level = augmentation_level
         
-        # Cache special token indices
+        # Special tokens
         self.pad_idx = word2idx['<pad>']
         self.start_idx = word2idx['<start>']
         self.end_idx = word2idx['<end>']
         self.unk_idx = word2idx['<unk>']
-        self.vocab_size = len(word2idx)
         
-        # Heavy augmentation transforms
+        # Transforms
         if augmentation_level == 'heavy':
             self.transform = self._get_heavy_augmentation(img_size)
-        else:  # extreme
+        else:
             self.transform = self._get_extreme_augmentation(img_size)
     
     def _get_heavy_augmentation(self, img_size):
-        """Augmentation mạnh nhưng vẫn giữ tính realism"""
+        """Heavy augmentation"""
         return transforms.Compose([
-            transforms.Resize((img_size + 48, img_size + 48), 
-                            interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.Resize((img_size + 48, img_size + 48)),
             transforms.RandomCrop((img_size, img_size)),
-            
-            # Geometric augmentations
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.2),  # Thêm vertical flip
-            transforms.RandomRotation(degrees=30),  # Tăng từ 10 lên 30 độ
+            transforms.RandomVerticalFlip(p=0.2),
+            transforms.RandomRotation(degrees=30),
             transforms.RandomAffine(
-                degrees=0,
-                translate=(0.1, 0.1),  # Translation
-                scale=(0.8, 1.2),      # Scaling
-                shear=10               # Shearing
+                degrees=0, translate=(0.1, 0.1),
+                scale=(0.8, 1.2), shear=10
             ),
-            
-            # Color augmentations
             transforms.ColorJitter(
-                brightness=0.4,  # Tăng từ 0.2
-                contrast=0.4,    # Tăng từ 0.2
-                saturation=0.4,  # Tăng từ 0.2
-                hue=0.2          # Tăng từ 0.1
+                brightness=0.4, contrast=0.4,
+                saturation=0.4, hue=0.2
             ),
-            transforms.RandomGrayscale(p=0.1),  # Thêm grayscale
-            
-            # Blur augmentations
+            transforms.RandomGrayscale(p=0.1),
             transforms.RandomApply([
                 transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0))
             ], p=0.3),
-            
             transforms.ToTensor(),
-            
-            # Random erasing (giống cutout)
-            transforms.RandomErasing(
-                p=0.3,
-                scale=(0.02, 0.15),
-                ratio=(0.3, 3.3)
-            ),
-            
+            transforms.RandomErasing(p=0.3, scale=(0.02, 0.15)),
             transforms.Normalize(
-                mean=[0.485, 0.456, 0.406], 
+                mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225]
             )
         ])
     
     def _get_extreme_augmentation(self, img_size):
-        """Augmentation cực mạnh cho dữ liệu augmented thêm"""
+        """Extreme augmentation"""
         return transforms.Compose([
-            transforms.Resize((img_size + 64, img_size + 64), 
-                            interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.Resize((img_size + 64, img_size + 64)),
             transforms.RandomCrop((img_size, img_size)),
-            
-            # Extreme geometric
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomVerticalFlip(p=0.3),
             transforms.RandomRotation(degrees=45),
             transforms.RandomAffine(
-                degrees=0,
-                translate=(0.15, 0.15),
-                scale=(0.7, 1.3),
-                shear=15
+                degrees=0, translate=(0.15, 0.15),
+                scale=(0.7, 1.3), shear=15
             ),
             transforms.RandomPerspective(distortion_scale=0.3, p=0.3),
-            
-            # Extreme color
             transforms.ColorJitter(
-                brightness=0.5,
-                contrast=0.5,
-                saturation=0.5,
-                hue=0.3
+                brightness=0.5, contrast=0.5,
+                saturation=0.5, hue=0.3
             ),
             transforms.RandomGrayscale(p=0.15),
             transforms.RandomInvert(p=0.1),
             transforms.RandomPosterize(bits=4, p=0.2),
             transforms.RandomSolarize(threshold=128, p=0.2),
-            
-            # Multiple blur options
             transforms.RandomApply([
                 transforms.GaussianBlur(kernel_size=7, sigma=(0.1, 3.0))
             ], p=0.4),
-            
             transforms.ToTensor(),
-            
-            # Aggressive erasing
-            transforms.RandomErasing(
-                p=0.4,
-                scale=(0.02, 0.2),
-                ratio=(0.3, 3.3)
-            ),
-            
+            transforms.RandomErasing(p=0.4, scale=(0.02, 0.2)),
             transforms.Normalize(
-                mean=[0.485, 0.456, 0.406], 
+                mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225]
             )
         ])
@@ -202,7 +182,7 @@ class HeavyAugmentedFlickr8kDataset(Dataset):
             image = Image.open(img_path).convert('RGB')
             image = self.transform(image)
         except Exception as e:
-            print(f"⚠️ Error loading {img_path}: {e}")
+            # Fallback: black image
             image = torch.zeros(3, 224, 224)
         
         # Tokenize
@@ -223,30 +203,36 @@ class HeavyAugmentedFlickr8kDataset(Dataset):
 
 
 # =====================================================================
-# ENHANCED TRAINER với Early Stopping
+# MULTI-GPU TRAINER
 # =====================================================================
-class EnhancedTrainer:
-    """
-    Trainer với:
-    - Early stopping
-    - Learning rate reduction on plateau
-    - Better checkpoint management
-    """
+class MultiGPUTrainer:
+    """Trainer hỗ trợ multi-GPU với DDP"""
     
-    def __init__(self, model: nn.Module, train_loader: DataLoader, val_loader: DataLoader,
-                 config: Dict, device: str = 'cuda', local_rank: int = 0):
+    def __init__(
+        self, 
+        model: nn.Module, 
+        train_loader: DataLoader, 
+        val_loader: DataLoader,
+        config: Dict, 
+        rank: int,
+        world_size: int
+    ):
         self.config = config
-        self.device = device
-        self.local_rank = local_rank
-        self.is_main = (local_rank == 0)
+        self.rank = rank
+        self.world_size = world_size
+        self.is_main = (rank == 0)
         
-        # Training hyperparameters
+        # Device
+        self.device = f'cuda:{rank}'
+        torch.cuda.set_device(rank)
+        
+        # Training params
         self.grad_accum_steps = config.get('grad_accum_steps', 4)
         self.grad_clip = config.get('grad_clip', 1.0)
         self.label_smoothing = config.get('label_smoothing', 0.1)
         self.use_amp = config.get('use_amp', True)
         
-        # Early stopping parameters
+        # Early stopping
         self.patience = config.get('patience', 5)
         self.patience_counter = 0
         self.min_delta = config.get('min_delta', 0.001)
@@ -256,9 +242,13 @@ class EnhancedTrainer:
         self.val_loader = val_loader
         
         # Model setup
-        self.model = model.to(device)
-        if torch.cuda.device_count() > 1 and dist.is_initialized():
-            self.model = DDP(self.model, device_ids=[local_rank])
+        self.model = model.to(self.device)
+        self.model = DDP(
+            self.model, 
+            device_ids=[rank],
+            output_device=rank,
+            find_unused_parameters=False  # Tối ưu performance
+        )
         
         # Optimizer and scheduler
         self.optimizer = self._create_optimizer()
@@ -273,11 +263,12 @@ class EnhancedTrainer:
         self.best_val_loss = float('inf')
         
         # Checkpoint directory
-        self.checkpoint_dir = Path(config.get('checkpoint_dir', './checkpoints'))
-        self.checkpoint_dir.mkdir(exist_ok=True, parents=True)
+        self.checkpoint_dir = Path(config.get('checkpoint_dir', '/kaggle/working/checkpoints'))
+        if self.is_main:
+            self.checkpoint_dir.mkdir(exist_ok=True, parents=True)
     
     def _create_optimizer(self):
-        """Create optimizer with separate weight decay"""
+        """Create optimizer"""
         decay = []
         no_decay = []
         
@@ -297,7 +288,7 @@ class EnhancedTrainer:
         return optimizer
     
     def _create_scheduler(self):
-        """Create OneCycleLR scheduler"""
+        """Create scheduler"""
         total_steps = len(self.train_loader) * self.config.get('epochs', 20) // self.grad_accum_steps
         
         scheduler = OneCycleLR(
@@ -318,7 +309,11 @@ class EnhancedTrainer:
         total_loss = 0
         total_tokens = 0
         
-        pbar = tqdm(self.train_loader, desc=f'Epoch {self.epoch}', 
+        # Set epoch for sampler
+        if hasattr(self.train_loader.sampler, 'set_epoch'):
+            self.train_loader.sampler.set_epoch(self.epoch)
+        
+        pbar = tqdm(self.train_loader, desc=f'[GPU{self.rank}] Epoch {self.epoch}',
                    disable=not self.is_main)
         
         for step, batch in enumerate(pbar):
@@ -370,6 +365,11 @@ class EnhancedTrainer:
                     'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
                 })
         
+        # Sync metrics across GPUs
+        metrics = torch.tensor([total_loss, total_tokens], device=self.device)
+        dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+        total_loss, total_tokens = metrics.cpu().numpy()
+        
         avg_loss = total_loss / max(total_tokens, 1)
         return avg_loss
     
@@ -380,7 +380,7 @@ class EnhancedTrainer:
         total_loss = 0
         total_tokens = 0
         
-        pbar = tqdm(self.val_loader, desc='Validation', 
+        pbar = tqdm(self.val_loader, desc=f'[GPU{self.rank}] Validation',
                    disable=not self.is_main)
         
         for batch in pbar:
@@ -404,30 +404,33 @@ class EnhancedTrainer:
             if self.is_main:
                 pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
         
+        # Sync metrics
+        metrics = torch.tensor([total_loss, total_tokens], device=self.device)
+        dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+        total_loss, total_tokens = metrics.cpu().numpy()
+        
         avg_loss = total_loss / max(total_tokens, 1)
         return avg_loss
     
     def check_early_stopping(self, val_loss):
-        """Check if should early stop"""
+        """Check early stopping"""
         if val_loss < self.best_val_loss - self.min_delta:
             self.best_val_loss = val_loss
             self.patience_counter = 0
-            return False, True  # Continue training, is_best
+            return False, True
         else:
             self.patience_counter += 1
             if self.patience_counter >= self.patience:
-                return True, False  # Stop training, not_best
-            return False, False  # Continue training, not_best
+                return True, False
+            return False, False
     
     def save_checkpoint(self, is_best: bool = False, is_last: bool = False):
-        """Save checkpoint"""
+        """Save checkpoint (only main process)"""
         if not self.is_main:
             return
         
-        if isinstance(self.model, DDP):
-            model_state = self.model.module.state_dict()
-        else:
-            model_state = self.model.state_dict()
+        # Get model state (unwrap DDP)
+        model_state = self.model.module.state_dict()
         
         checkpoint = {
             'epoch': self.epoch,
@@ -443,27 +446,28 @@ class EnhancedTrainer:
         if is_best:
             best_path = self.checkpoint_dir / 'best_model_augmented.pt'
             torch.save(checkpoint, best_path)
-            print(f"🏆 Saved BEST augmented model (val_loss={self.best_val_loss:.4f}): {best_path}")
+            print(f"🏆 Saved BEST model: {best_path}")
         
         if is_last:
             last_path = self.checkpoint_dir / 'last_checkpoint_augmented.pt'
             torch.save(checkpoint, last_path)
-            print(f"💾 Saved last checkpoint (epoch {self.epoch}): {last_path}")
+            print(f"💾 Saved last checkpoint: {last_path}")
     
     def load_checkpoint(self, checkpoint_path: str):
-        """Load checkpoint to resume training"""
+        """Load checkpoint"""
         if not os.path.exists(checkpoint_path):
-            print(f"⚠️ Checkpoint not found: {checkpoint_path}")
+            if self.is_main:
+                print(f"⚠️ Checkpoint not found: {checkpoint_path}")
             return False
         
-        print(f"📥 Loading checkpoint: {checkpoint_path}")
+        if self.is_main:
+            print(f"📥 Loading checkpoint: {checkpoint_path}")
+        
+        # Load to correct device
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
-        # Load model
-        if isinstance(self.model, DDP):
-            self.model.module.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Load model (unwrap DDP)
+        self.model.module.load_state_dict(checkpoint['model_state_dict'])
         
         # Load optimizer and scheduler
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -475,33 +479,25 @@ class EnhancedTrainer:
         self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         self.patience_counter = checkpoint.get('patience_counter', 0)
         
-        print(f"✅ Resumed from epoch {self.epoch}, best_val_loss={self.best_val_loss:.4f}")
+        if self.is_main:
+            print(f"✅ Resumed from epoch {self.epoch}")
+        
         return True
     
     def train(self, num_epochs: int):
-        """Full training loop with early stopping"""
-        print("\n" + "="*70)
-        print("🚀 BẮT ĐẦU TRAINING VỚI HEAVY AUGMENTATION")
-        print("="*70)
-        
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        
+        """Full training loop"""
         if self.is_main:
-            print(f"📊 Total parameters: {total_params/1e6:.2f}M")
-            print(f"📊 Trainable parameters: {trainable_params/1e6:.2f}M")
-            print(f"🔧 Gradient accumulation: {self.grad_accum_steps}")
+            print("\n" + "="*70)
+            print("🚀 MULTI-GPU TRAINING với HEAVY AUGMENTATION")
+            print("="*70)
+            print(f"🖥️ World size: {self.world_size} GPUs")
             print(f"🔧 Early stopping patience: {self.patience}")
-            print(f"💾 Data augmentation: HEAVY (3x augmented dataset)")
             print("="*70 + "\n")
         
         start_epoch = self.epoch
         
         for epoch in range(start_epoch, start_epoch + num_epochs):
             self.epoch = epoch
-            
-            if hasattr(self.train_loader.sampler, 'set_epoch'):
-                self.train_loader.sampler.set_epoch(epoch)
             
             # Train
             start_time = time.time()
@@ -513,50 +509,194 @@ class EnhancedTrainer:
             
             if self.is_main:
                 print(f"\n{'='*70}")
-                print(f"📈 Epoch {epoch} Summary:")
-                print(f"   Train Loss: {train_loss:.4f} | Train PPL: {np.exp(train_loss):.2f}")
-                print(f"   Val Loss: {val_loss:.4f} | Val PPL: {np.exp(val_loss):.2f}")
-                print(f"   Time: {train_time:.1f}s")
-                print(f"   Patience counter: {self.patience_counter}/{self.patience}")
+                print(f"📈 Epoch {epoch}:")
+                print(f"   Train Loss: {train_loss:.4f} | PPL: {np.exp(train_loss):.2f}")
+                print(f"   Val Loss: {val_loss:.4f} | PPL: {np.exp(val_loss):.2f}")
+                print(f"   Time: {train_time:.1f}s | Patience: {self.patience_counter}/{self.patience}")
                 print(f"{'='*70}\n")
             
-            # Early stopping check
+            # Early stopping
             should_stop, is_best = self.check_early_stopping(val_loss)
             
             if is_best:
-                self.save_checkpoint(is_best=True, is_last=False)
+                self.save_checkpoint(is_best=True)
             
-            self.save_checkpoint(is_best=False, is_last=True)
+            self.save_checkpoint(is_last=True)
             
             if should_stop:
                 if self.is_main:
-                    print("\n" + "="*70)
-                    print("🛑 EARLY STOPPING TRIGGERED")
-                    print(f"   No improvement for {self.patience} epochs")
-                    print(f"   Best val loss: {self.best_val_loss:.4f}")
-                    print("="*70)
+                    print(f"\n🛑 Early stopping at epoch {epoch}")
                 break
         
         if self.is_main:
-            print("\n" + "="*70)
-            print("✅ TRAINING COMPLETED")
-            print(f"🏆 Best validation loss: {self.best_val_loss:.4f}")
-            print("="*70)
+            print(f"\n✅ Training completed! Best val loss: {self.best_val_loss:.4f}")
+
+
+# =====================================================================
+# WORKER FUNCTION
+# =====================================================================
+def train_worker(rank, world_size, config):
+    """Worker function cho mỗi GPU"""
+    
+    # Setup distributed
+    setup_distributed(rank, world_size)
+    
+    try:
+        # Set seed
+        torch.manual_seed(42 + rank)
+        np.random.seed(42 + rank)
+        
+        # Load vocabulary
+        vocab_path = Path(config['vocab_dir']) / 'vocab.json'
+        with open(vocab_path, 'r') as f:
+            vocab_data = json.load(f)
+            word2idx = vocab_data['word2idx']
+        
+        config['vocab_size'] = len(word2idx)
+        config['pad_idx'] = word2idx['<pad>']
+        
+        if rank == 0:
+            print(f"✓ Loaded vocabulary: {config['vocab_size']} tokens")
+        
+        # Load data
+        from train import Flickr8kProcessor
+        processor = Flickr8kProcessor(config['data_dir'])
+        df = processor.load_and_clean_captions()
+        train_df, val_df, _ = processor.split_dataset(df)
+        
+        images_dir = processor.images_dir
+        
+        # Create augmented datasets
+        train_dataset_1 = HeavyAugmentedFlickr8kDataset(
+            train_df, images_dir, word2idx,
+            max_length=config['max_seq_len'],
+            img_size=config['img_size'],
+            augmentation_level='heavy'
+        )
+        
+        train_dataset_2 = HeavyAugmentedFlickr8kDataset(
+            train_df, images_dir, word2idx,
+            max_length=config['max_seq_len'],
+            img_size=config['img_size'],
+            augmentation_level='heavy'
+        )
+        
+        train_dataset_3 = HeavyAugmentedFlickr8kDataset(
+            train_df, images_dir, word2idx,
+            max_length=config['max_seq_len'],
+            img_size=config['img_size'],
+            augmentation_level='extreme'
+        )
+        
+        combined_train_dataset = ConcatDataset([
+            train_dataset_1,
+            train_dataset_2,
+            train_dataset_3
+        ])
+        
+        if rank == 0:
+            print(f"✓ Augmented training samples: {len(combined_train_dataset)} (3x)")
+        
+        # Validation dataset
+        from train import Flickr8kDataset
+        val_dataset = Flickr8kDataset(
+            val_df, images_dir, word2idx,
+            max_length=config['max_seq_len'],
+            img_size=config['img_size'],
+            is_train=False
+        )
+        
+        # Create samplers
+        train_sampler = DistributedSampler(
+            combined_train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=True
+        )
+        
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False
+        )
+        
+        # Create dataloaders
+        train_loader = DataLoader(
+            combined_train_dataset,
+            batch_size=config['batch_size'],
+            sampler=train_sampler,
+            num_workers=config['num_workers'],
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config['batch_size'],
+            sampler=val_sampler,
+            num_workers=config['num_workers'],
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True
+        )
+        
+        # Create model
+        model = ModernImageCaptioningModel(
+            vocab_size=config['vocab_size'],
+            img_size=config['img_size'],
+            patch_size=config['patch_size'],
+            max_seq_len=config['max_seq_len'],
+            embed_dim=config['embed_dim'],
+            encoder_depth=config['encoder_depth'],
+            decoder_depth=config['decoder_depth'],
+            num_heads=config['num_heads'],
+            num_kv_heads=config['num_kv_heads'],
+            mlp_ratio=config['mlp_ratio'],
+            dropout=config['dropout'],
+            drop_path_rate=config['drop_path_rate'],
+            num_registers=config['num_registers']
+        )
+        
+        # Create trainer
+        trainer = MultiGPUTrainer(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            config=config,
+            rank=rank,
+            world_size=world_size
+        )
+        
+        # Load checkpoint if exists
+        if config.get('resume_checkpoint'):
+            trainer.load_checkpoint(config['resume_checkpoint'])
+        
+        # Train
+        trainer.train(num_epochs=config['epochs'])
+        
+    finally:
+        # Cleanup
+        cleanup_distributed()
 
 
 # =====================================================================
 # MAIN FUNCTION
 # =====================================================================
 def main():
-    """Main training script with heavy augmentation"""
+    """Main entry point"""
     
+    # Configuration
     config = {
-        # Paths
+        # Paths (FIXED for Kaggle)
         'data_dir': '/kaggle/input/flickr8k',
-        'checkpoint_dir': '/kaggle/input/vit-gpt2-nano/checkpoints',
+        'vocab_dir': '/kaggle/input/vit-gpt2-nano/checkpoints',
+        'checkpoint_dir': '/kaggle/working/checkpoints',  # Writable directory
         'resume_checkpoint': '/kaggle/input/vit-gpt2-nano/checkpoints/last_checkpoint.pt',
         
-        # Model architecture (same as before)
+        # Model
         'vocab_size': None,
         'img_size': 224,
         'patch_size': 16,
@@ -567,18 +707,18 @@ def main():
         'num_heads': 12,
         'num_kv_heads': 4,
         'mlp_ratio': 4.0,
-        'dropout': 0.1,  # Tăng dropout
-        'drop_path_rate': 0.2,  # Tăng drop path
+        'dropout': 0.1,
+        'drop_path_rate': 0.2,
         'num_registers': 4,
         
-        # Training (adjusted for augmented data)
-        'batch_size': 36,  # Giảm một chút do augmentation nặng
-        'epochs': 5,  # Training thêm
-        'lr': 1e-4,  # Lower learning rate khi resume
-        'weight_decay': 0.02,  # Tăng weight decay
+        # Training (adjusted for 2 GPUs)
+        'batch_size': 32,  # Per GPU: 18 x 2 = 36 total
+        'epochs': 3,
+        'lr': 1e-4,
+        'weight_decay': 0.02,
         'grad_clip': 1.0,
-        'grad_accum_steps': 5,  # Tăng để maintain effective batch size
-        'label_smoothing': 0.15,  # Tăng label smoothing
+        'grad_accum_steps': 5,
+        'label_smoothing': 0.15,
         
         # Early stopping
         'patience': 5,
@@ -588,181 +728,43 @@ def main():
         'use_amp': True,
         
         # Data
-        'num_workers': 4,
-        'pin_memory': True,
-        'prefetch_factor': 2,
-        'min_word_freq': 2,
-        
-        # Augmentation
-        'augmentation_multiplier': 3,  # 3x data
+        'num_workers': 2,  # Per GPU
     }
     
-    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    # Check GPU availability
+    if not torch.cuda.is_available():
+        raise RuntimeError("❌ CUDA not available!")
+    
+    world_size = torch.cuda.device_count()
+    
+    if world_size < 2:
+        raise RuntimeError(f"❌ Need 2 GPUs, but only {world_size} available!")
     
     print("\n" + "="*70)
-    print("🎯 RESUME TRAINING VỚI HEAVY DATA AUGMENTATION")
+    print("🚀 MULTI-GPU TRAINING SETUP")
     print("="*70)
-    print(f"🖥️ Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+    print(f"🖥️ Available GPUs: {world_size}")
+    for i in range(world_size):
+        print(f"   GPU {i}: {torch.cuda.get_device_name(i)}")
+    print("="*70 + "\n")
     
-    # ===== LOAD DATA =====
-    print("\n" + "-"*70)
-    print("STEP 1: Load Data và Vocabulary")
-    print("-"*70)
-    
-    # Load vocabulary
-    vocab_path = Path(config['checkpoint_dir']) / 'vocab.json'
-    with open(vocab_path, 'r') as f:
-        vocab_data = json.load(f)
-        word2idx = vocab_data['word2idx']
-        idx2word = vocab_data['idx2word']
-    
-    config['vocab_size'] = len(word2idx)
-    config['pad_idx'] = word2idx['<pad>']
-    
-    print(f"✓ Loaded vocabulary: {config['vocab_size']} tokens")
-    
-    # Load captions
-    from train import Flickr8kProcessor
-    processor = Flickr8kProcessor(config['data_dir'])
-    df = processor.load_and_clean_captions()
-    train_df, val_df, test_df = processor.split_dataset(df)
-    
-    # ===== CREATE AUGMENTED DATASETS =====
-    print("\n" + "-"*70)
-    print("STEP 2: Create 3x Augmented Training Dataset")
-    print("-"*70)
-    
-    images_dir = processor.images_dir
-    
-    # Dataset 1: Heavy augmentation
-    train_dataset_1 = HeavyAugmentedFlickr8kDataset(
-        train_df, images_dir, word2idx,
-        max_length=config['max_seq_len'],
-        img_size=config['img_size'],
-        augmentation_level='heavy'
-    )
-    
-    # Dataset 2: Heavy augmentation (different random seed)
-    train_dataset_2 = HeavyAugmentedFlickr8kDataset(
-        train_df, images_dir, word2idx,
-        max_length=config['max_seq_len'],
-        img_size=config['img_size'],
-        augmentation_level='heavy'
-    )
-    
-    # Dataset 3: Extreme augmentation
-    train_dataset_3 = HeavyAugmentedFlickr8kDataset(
-        train_df, images_dir, word2idx,
-        max_length=config['max_seq_len'],
-        img_size=config['img_size'],
-        augmentation_level='extreme'
-    )
-    
-    # Combine all datasets
-    combined_train_dataset = ConcatDataset([
-        train_dataset_1,
-        train_dataset_2,
-        train_dataset_3
-    ])
-    
-    print(f"✓ Original training samples: {len(train_dataset_1)}")
-    print(f"✓ Augmented training samples: {len(combined_train_dataset)} (3x)")
-    
-    # Validation dataset (no augmentation)
-    from train import Flickr8kDataset
-    val_dataset = Flickr8kDataset(
-        val_df, images_dir, word2idx,
-        max_length=config['max_seq_len'],
-        img_size=config['img_size'],
-        is_train=False
-    )
-    
-    # Create dataloaders
-    train_loader = DataLoader(
-        combined_train_dataset,
-        batch_size=config['batch_size'],
-        shuffle=True,
-        num_workers=config['num_workers'],
-        pin_memory=config['pin_memory'],
-        prefetch_factor=config['prefetch_factor'],
-        persistent_workers=True,
-        drop_last=True
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config['batch_size'],
-        shuffle=False,
-        num_workers=config['num_workers'],
-        pin_memory=config['pin_memory'],
-        prefetch_factor=config['prefetch_factor'],
-        persistent_workers=True
-    )
-    
-    print(f"✓ Train batches: {len(train_loader)}")
-    print(f"✓ Val batches: {len(val_loader)}")
-    
-    # ===== CREATE MODEL =====
-    print("\n" + "-"*70)
-    print("STEP 3: Create Model")
-    print("-"*70)
-    
-    model = ModernImageCaptioningModel(
-        vocab_size=config['vocab_size'],
-        img_size=config['img_size'],
-        patch_size=config['patch_size'],
-        max_seq_len=config['max_seq_len'],
-        embed_dim=config['embed_dim'],
-        encoder_depth=config['encoder_depth'],
-        decoder_depth=config['decoder_depth'],
-        num_heads=config['num_heads'],
-        num_kv_heads=config['num_kv_heads'],
-        mlp_ratio=config['mlp_ratio'],
-        dropout=config['dropout'],
-        drop_path_rate=config['drop_path_rate'],
-        num_registers=config['num_registers']
-    )
-    
-    # ===== CREATE TRAINER AND LOAD CHECKPOINT =====
-    print("\n" + "-"*70)
-    print("STEP 4: Create Trainer và Load Checkpoint")
-    print("-"*70)
-    
-    trainer = EnhancedTrainer(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        config=config,
-        device=device
-    )
-    
-    # Load previous checkpoint
-    checkpoint_loaded = trainer.load_checkpoint(config['resume_checkpoint'])
-    
-    if not checkpoint_loaded:
-        print("⚠️ Could not load checkpoint, starting from scratch")
-    
-    # ===== TRAIN =====
-    print("\n" + "-"*70)
-    print("STEP 5: Start Training with Heavy Augmentation")
-    print("-"*70)
-    
-    trainer.train(num_epochs=config['epochs'])
-    
-    print("\n" + "="*70)
-    print("✅ ALL DONE!")
-    print("="*70)
-
-
-if __name__ == '__main__':
     # Enable optimizations
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
     
-    # Set seed
-    torch.manual_seed(42)
-    np.random.seed(42)
+    # Spawn processes
+    mp.spawn(
+        train_worker,
+        args=(world_size, config),
+        nprocs=world_size,
+        join=True
+    )
     
-    # Run
+    print("\n" + "="*70)
+    print("✅ TRAINING COMPLETED!")
+    print("="*70)
+
+
+if __name__ == '__main__':
     main()
