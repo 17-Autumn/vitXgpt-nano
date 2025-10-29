@@ -812,8 +812,8 @@ def main():
         'num_registers': 4,
         
         # Training hyperparameters (giữ nguyên như code 1)
-        'batch_size': 32,  # Per GPU
-        'epochs': 2,
+        'batch_size': 38,  # Per GPU
+        'epochs': 12,
         'lr': 1e-4,
         'weight_decay': 0.02,
         'grad_clip': 1.0,
