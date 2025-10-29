@@ -671,7 +671,7 @@ def main():
         
         # Training hyperparameters (tối ưu cho T4)
         'batch_size': 32,
-        'epochs': 12,
+        'epochs': 24,
         'lr': 3e-4,
         'weight_decay': 0.01,
         'grad_clip': 1.0,
@@ -872,6 +872,7 @@ if __name__ == '__main__':
     
     # Run training
     main()
+
 
 
 
